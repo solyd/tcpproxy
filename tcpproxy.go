@@ -324,6 +324,9 @@ type DialProxy struct {
 	// no graceful downgrade.
 	// If zero, no PROXY header is sent. Currently, version 1 is supported.
 	ProxyProtocolVersion int
+
+	// Prints out connections and data transferred
+	DebugMode bool
 }
 
 // UnderlyingConn returns c.Conn if c of type *Conn,
@@ -352,6 +355,12 @@ func (dp *DialProxy) HandleConn(src net.Conn) {
 	}
 	defer dst.Close()
 
+	if dp.DebugMode {
+		log.Printf("Forwarding src: [%v -> %v] ==> dst: [%v -> %v]",
+			src.RemoteAddr(), src.LocalAddr(),
+			dst.LocalAddr(), dst.RemoteAddr())
+	}
+
 	if err = dp.sendProxyHeader(dst, src); err != nil {
 		dp.onDialError()(src, err)
 		return
@@ -370,12 +379,16 @@ func (dp *DialProxy) HandleConn(src net.Conn) {
 	}
 
 	errc := make(chan error, 1)
-	go proxyCopy(errc, src, dst)
-	go proxyCopy(errc, dst, src)
+	go proxyCopyToDst(errc, src, dst, dp.DebugMode)
+	go proxyCopyFromSrc(errc, dst, src, dp.DebugMode)
 	<-errc
 }
 
 func (dp *DialProxy) sendProxyHeader(w io.Writer, src net.Conn) error {
+	if dp.DebugMode {
+		log.Printf("sendProxyHeader version: %v", dp.ProxyProtocolVersion)
+	}
+
 	switch dp.ProxyProtocolVersion {
 	case 0:
 		return nil
@@ -397,7 +410,17 @@ func (dp *DialProxy) sendProxyHeader(w io.Writer, src net.Conn) error {
 		if srcAddr.IP.To4() == nil {
 			family = "TCP6"
 		}
-		_, err := fmt.Fprintf(w, "PROXY %s %s %d %s %d\r\n", family, srcAddr.IP, srcAddr.Port, dstAddr.IP, dstAddr.Port)
+
+		proxyHeader := fmt.Sprintf("PROXY %s %s %s %d %d",
+			family,
+			srcAddr.IP, dstAddr.IP,
+			srcAddr.Port, dstAddr.Port)
+
+		if dp.DebugMode {
+			log.Printf("proxy header: [%v]", proxyHeader)
+		}
+
+		_, err := fmt.Fprintf(w, proxyHeader + "\r\n")
 		return err
 	default:
 		return fmt.Errorf("PROXY protocol version %d not supported", dp.ProxyProtocolVersion)
@@ -414,6 +437,22 @@ func proxyCopy(errc chan<- error, dst io.Writer, src io.Reader) {
 	// readability, use that to avoid stranding big blocks of
 	// memory blocked in idle reads.
 	_, err := io.Copy(dst, src)
+	errc <- err
+}
+
+func proxyCopyFromSrc(errc chan<- error, dst io.Writer, src io.Reader, debugMode bool) {
+	written, err := io.Copy(dst, src)
+	if debugMode {
+		log.Printf("(Connection closing) Copied FROM origin: [%v], err: [%v]", written, err)
+	}
+	errc <- err
+}
+
+func proxyCopyToDst(errc chan<- error, dst io.Writer, src io.Reader, debugMode bool) {
+	written, err := io.Copy(dst, src)
+	if debugMode {
+		log.Printf("(Connection closing) Copied TO origin: [%v], err: [%v]", written, err)
+	}
 	errc <- err
 }
 
